@@ -26,6 +26,70 @@ input, textarea, [contenteditable] { user-select: text; }
   fill: oklch(0.55 0.18 160) !important;
 }
 
+.score-sheet-area {
+  position: relative;
+  min-height: 0;
+  flex: 1;
+}
+.score-page {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: white;
+  border-radius: 0.75rem;
+  touch-action: manipulation;
+}
+.score-page > svg { display: block; width: 100%; height: 100%; }
+.score-page g.note { cursor: pointer; }
+.score-page .ledgerLines { pointer-events: none; }
+.score-page .selected-score-bar { outline: 2px solid #38bdf8; }
+.score-page .current-note[data-score-hand='left'] * { fill: #13874c !important; }
+.score-page .current-note[data-score-hand='right'] * { fill: #2563eb !important; }
+.score-playhead { pointer-events: none; }
+.score-playhead line { stroke-linecap: round; }
+.score-playhead-halo { stroke: white; stroke-width: 7px; }
+.score-playhead-line { stroke: #d43a13; stroke-width: 4px; }
+
+.score-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem 0.75rem;
+  font-size: 0.75rem;
+}
+.score-control {
+  min-height: 34px;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: var(--panel);
+  color: var(--ink);
+}
+.score-control:disabled { opacity: 0.45; }
+.score-control:not(:disabled) { cursor: pointer; }
+.score-position {
+  display: block;
+  width: 100%;
+  height: 24px;
+  margin: 0 0 0.25rem;
+  accent-color: var(--accent);
+}
+.score-keyboard {
+  display: block;
+  width: 100%;
+  height: clamp(32px, 10dvh, 76px);
+  overflow: hidden;
+  border-radius: 0.35rem;
+}
+.score-key.white { fill: #f5f5f5; stroke: #6b7280; stroke-width: 1; }
+.score-key.black { fill: #161b26; stroke: #070a12; stroke-width: 1; }
+.score-key[data-highlight='left'] { fill: #22c55e; }
+.score-key[data-highlight='right'] { fill: #3b82f6; }
+.score-key[data-highlight='both'] { fill: #a855f7; }
+.score-key[data-highlight='active'] { fill: #f59e0b; }
+.score-keyboard text { fill: #202833; font: 10px system-ui, sans-serif; }
+
 /* Subtle float for ambient glows */
 @keyframes nebula-drift {
   0%, 100% { transform: translate(0, 0) scale(1); }

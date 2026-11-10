@@ -1,9 +1,11 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo, useLayoutEffect } from 'react'
 import { unzipSync } from 'fflate'
 import createVerovioModule from 'verovio/wasm'
 import { VerovioToolkit } from 'verovio/esm'
 import * as Tone from 'tone'
-import { SplendidGrandPiano } from 'smplr'
+import DOMPurify from 'dompurify'
+import { Soundfont2 } from 'smplr'
+import { SoundFont2 } from 'soundfont2'
 import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { noteNameToMidi, getInterval } from '../utils/noteConversion'
 import { getSavedFolder, pickFolder } from '../lib/scoreFolder'
@@ -11,21 +13,23 @@ import { isMobile } from '../lib/platform'
 import { enableMidi, listenToDevice, notesMatch, onDevicesChanged } from '../input/midiInput'
 import { startBasicPitchDetection, loadBasicPitchModel, isBasicPitchReady } from '../input/pitchDetector'
 import { StepGate } from '../practice/stepGate'
-import { parseNoteTimelineOSMD } from '../parsers/osmdParser'
-import { tickToSec } from '../parsers/parseTimeline'
+import { buildPlaybackFrames, buildPracticeSteps, collectScorePlayback, playbackFrameAt, preparePlaybackScore } from '../parsers/verovioPlayback'
+import { useScorePlayer } from '../playback/useScorePlayer'
+import ScoreKeyboard from '../components/ScoreKeyboard'
+import ScorePage from '../components/ScorePage'
+import { PORTRAIT_QUERY, indexScorePages, scorePageSize } from '../utils/scoreLayout'
 import Background from '../Background'
 
 /** Unzip an MXL (ZIP) ArrayBuffer and return the inner MusicXML string. */
-function mxlToXml(buffer) {
+function mxlToXml(bytes) {
   try {
-    const files = unzipSync(new Uint8Array(buffer))
+    const files = unzipSync(bytes)
     const containerBytes = files['META-INF/container.xml']
     if (!containerBytes) return null
-    const containerStr = new TextDecoder().decode(containerBytes)
-    const m = containerStr.match(/full-path="([^"]+\.xml)"/)
-    if (!m) return null
-    const bytes = files[m[1]]
-    return bytes ? new TextDecoder().decode(bytes) : null
+    const decoder = new TextDecoder()
+    const container = new DOMParser().parseFromString(decoder.decode(containerBytes), 'text/xml')
+    const path = container.querySelector('rootfile')?.getAttribute('full-path')
+    return path && files[path] ? decoder.decode(files[path]) : null
   } catch { return null }
 }
 
@@ -33,11 +37,9 @@ function mxlToXml(buffer) {
 function decodeToXmlStr(musicXml) {
   if (typeof musicXml === 'string') return musicXml
   if (musicXml instanceof ArrayBuffer || musicXml instanceof Uint8Array) {
-    const buf = musicXml instanceof Uint8Array ? musicXml.buffer : musicXml
-    // Check ZIP magic bytes (PK\x03\x04)
-    const header = new Uint8Array(buf, 0, 4)
-    if (header[0] === 0x50 && header[1] === 0x4b) return mxlToXml(buf)
-    try { return new TextDecoder().decode(musicXml) } catch { return null }
+    const bytes = musicXml instanceof Uint8Array ? musicXml : new Uint8Array(musicXml)
+    if (bytes[0] === 0x50 && bytes[1] === 0x4b) return mxlToXml(bytes)
+    return new TextDecoder().decode(bytes)
   }
   return null
 }
@@ -75,6 +77,9 @@ function injectSystemBreaksAtTimeSigChange(xmlStr) {
 
 const HINT_DELAY_MS = 3000
 const MAX_WRONG_ATTEMPTS = 3
+const EMPTY_NOTES = []
+const PREVIEW_SECONDS = 0.45
+const screenOrientation = () => window.matchMedia(PORTRAIT_QUERY).matches ? 'portrait' : 'landscape'
 
 
 // ---------------------------------------------------------------------------
@@ -86,12 +91,22 @@ function App() {
   const [filename, setFilename] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [mode, setMode] = useState('idle') // 'idle' | 'listen' | 'practice'
+  const [practicing, setPracticing] = useState(false)
+  const [practicePaused, setPracticePaused] = useState(false)
   const [currentNoteIndex, setCurrentNoteIndex] = useState(0)
-  const [noteTimeline, setNoteTimeline] = useState([])
   const [detectedNote, setDetectedNote] = useState(null)
   const [completed, setCompleted] = useState(false)
-  const [paused, setPaused] = useState(false)
+  const [score, setScore] = useState(null)
+  const [orientation, setOrientation] = useState(screenOrientation)
+  const [layout, setLayout] = useState(null)
+  const [page, setPage] = useState(1)
+  const [pageSvg, setPageSvg] = useState('')
+  const [autoPage, setAutoPage] = useState(true)
+  const [hand, setHand] = useState('both')
+  const [swapHands, setSwapHands] = useState(false)
+  const [selectedBarId, setSelectedBarId] = useState(null)
+  const [positioned, setPositioned] = useState(false)
+  const [previewNote, setPreviewNote] = useState(null)
   const [showDemoModal, setShowDemoModal] = useState(false)
   const [showSheetPicker, setShowSheetPicker] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -99,7 +114,6 @@ function App() {
   const [folderPath, setFolderPath] = useState(() => getSavedFolder())
   const [showHint, setShowHint] = useState(false)
   const [bpm, setBpm] = useState(null)
-  const [scoreBpm, setScoreBpm] = useState(null) // original tempo from the score
   const [bpmInput, setBpmInput] = useState('')
   const [defaultBpm, setDefaultBpm] = useState(() => {
     const v = parseInt(localStorage.getItem('nf-default-bpm'), 10)
@@ -107,7 +121,6 @@ function App() {
   })
   const [defaultBpmInput, setDefaultBpmInput] = useState(String(defaultBpm))
   const [playbackSpeed, setPlaybackSpeed] = useState(1.0)
-  const [playerProgress, setPlayerProgress] = useState(0)
   const [inputError, setInputError] = useState(null)
   const [micPermission, setMicPermission] = useState(null)
   const [showMicPrompt, setShowMicPrompt] = useState(false)
@@ -118,25 +131,46 @@ function App() {
   const [selectedDeviceId, setSelectedDeviceId] = useState(null)
   const [anyOctave, setAnyOctave] = useState(false)
   const [inputMode, setInputMode] = useState(() => isMobile ? 'mic' : (localStorage.getItem('nf-input') || 'midi'))
-  const [autoscroll, setAutoscroll] = useState(true)
   const [modelLoading, setModelLoading] = useState(false)
   const [modelReady, setModelReady] = useState(false)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState([])
 
   const fileInputRef = useRef(null)
-  const svgContainerRef = useRef(null)   // Verovio SVG output container
   const vrvRef = useRef(null)            // VerovioToolkit instance
   const vrvModuleRef = useRef(null)      // Verovio WASM module
-  const tempoMapRef = useRef([{ tick: 0, bpm: 120 }]) // from OSMD parse
-  const baseTimelineRef = useRef(null) // original parsed { timeline, tempoMap }, before user BPM scaling
-
-  const toneSamplerRef = useRef(null)
-  const tonePartRef = useRef(null)
-  const toneListenRafRef = useRef(null)
-  const listenEndWallSecRef = useRef(0)  // total wall-clock duration at current playback speed
-  const listenTotalMusicalSecRef = useRef(0) // total musical duration (at original tempo)
-  const vrvCursorScheduleRef = useRef(null) // [{tstampMs, ids[]}] — cursor highlight events
+  const pianoRef = useRef(null)
+  const previewTimerRef = useRef(null)
+  const previewRequestRef = useRef(0)
+  const player = useScorePlayer(pianoRef)
+  const pausePlayback = player.pause
+  const mode = practicing ? 'practice' : player.status === 'idle' ? 'idle' : 'listen'
+  const paused = practicing ? practicePaused : player.status === 'paused'
+  const scoreBpm = score ? (score.hasTempo ? score.tempo : defaultBpm) : null
+  const tempoRate = score ? (bpm ?? scoreBpm) / score.tempo : 1
+  const sourceHand = swapHands && hand !== 'both' ? (hand === 'left' ? 'right' : 'left') : hand
+  const playNotes = useMemo(() => {
+    if (!score) return EMPTY_NOTES
+    if (!score.hasHands || sourceHand === 'both') return score.notes
+    return score.notes.filter(note => note.hand === sourceHand)
+  }, [score, sourceHand])
+  const noteTimeline = useMemo(() => buildPracticeSteps(playNotes, tempoRate), [playNotes, tempoRate])
+  const frames = useMemo(() => score ? buildPlaybackFrames(playNotes, score.bars) : [], [score, playNotes])
+  const frame = playbackFrameAt(frames, player.position)
+  const currentEntry = noteTimeline[currentNoteIndex]
+  const visibleBar = practicing ? currentEntry?.bar : frame?.bar
+  const hasPlaybackPosition = mode !== 'idle' || player.position > 0 || positioned
+  const activeNotes = previewNote ? [previewNote] : practicing ? currentEntry?.events ?? EMPTY_NOTES
+    : mode === 'listen' ? frame?.notes ?? EMPTY_NOTES : EMPTY_NOTES
+  const scoreHighlights = previewNote || practicing ? activeNotes : hasPlaybackPosition ? frame?.focusNotes ?? EMPTY_NOTES : EMPTY_NOTES
+  const visibleBarPage = layout?.pageByBarId.get(visibleBar?.id)
+  const selectedBarOnPage = layout?.pageByBarId.get(selectedBarId) === page
+  const selectedBar = selectedBarOnPage && (visibleBar?.id === selectedBarId
+    ? visibleBar : score?.bars.find(bar => bar.id === selectedBarId))
+  const pageAnchorId = (hasPlaybackPosition && autoPage ? visibleBar?.id : null)
+    ?? (selectedBarOnPage ? selectedBarId : null)
+    ?? (hasPlaybackPosition && visibleBarPage === page ? visibleBar?.id : null)
+    ?? layout?.firstBarByPage.get(page)
 
   const stopListenerRef = useRef(null)
   const stopMicRef = useRef(null)
@@ -159,9 +193,6 @@ function App() {
   const stepWaitRef = useRef(null)
   const micHeardRef = useRef(new Set()) // notes the mic reported last time (a note "is pressed" when it first appears)
   const wrongCountRef = useRef(0) // counts wrong attempts for current note
-  const lastTickSetRef = useRef(-1)
-  const autoscrollRef = useRef(true)
-  const playbackSpeedRef = useRef(1.0)
 
   useEffect(() => { musicXmlRef.current = musicXml }, [musicXml])
   useEffect(() => { currentNoteIndexRef.current = currentNoteIndex }, [currentNoteIndex])
@@ -170,11 +201,9 @@ function App() {
   useEffect(() => { pausedRef.current = paused }, [paused])
   useEffect(() => { anyOctaveRef.current = anyOctave }, [anyOctave])
   useEffect(() => { modeRef.current = mode }, [mode])
-  useEffect(() => { autoscrollRef.current = autoscroll }, [autoscroll])
-  useEffect(() => { playbackSpeedRef.current = playbackSpeed }, [playbackSpeed])
   useEffect(() => { localStorage.setItem('nf-input', inputMode) }, [inputMode])
   useEffect(() => { localStorage.setItem('nf-default-bpm', String(defaultBpm)) }, [defaultBpm])
-  useEffect(() => { setBpmInput(bpm != null ? String(bpm) : '') }, [bpm])
+  useEffect(() => { setBpmInput((bpm ?? scoreBpm) != null ? String(Math.round(bpm ?? scoreBpm)) : '') }, [bpm, scoreBpm])
   useEffect(() => { setDefaultBpmInput(String(defaultBpm)) }, [defaultBpm])
 
   // Load song passed from FolderLibrary via sessionStorage
@@ -219,31 +248,27 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // Init SplendidGrandPiano — lazy-loading, no upfront wait required
   useEffect(() => {
     Tone.getTransport().PPQ = 960
-    const audioCtx = Tone.getContext().rawContext
-    const piano = new SplendidGrandPiano(audioCtx, { decayTime: 8 })
-    toneSamplerRef.current = piano
+    const sampler = Soundfont2(Tone.getContext().rawContext, {
+      url: import.meta.env.BASE_URL + 'soundfont/sonivox.sf2',
+      createSoundfont: data => new SoundFont2(data),
+    })
+    // Sonivox General MIDI bank 0, program 0 (Piano 1).
+    const ready = sampler.ready.then(() => sampler.loadInstrument('001'))
+    ready.catch(error => console.error('[Piano]', error))
+    pianoRef.current = { sampler, ready }
     return () => {
-      Tone.getTransport().stop()
-      Tone.getTransport().cancel()
-      tonePartRef.current?.dispose()
-      tonePartRef.current = null
-      piano.stop()
-      toneSamplerRef.current = null
+      pianoRef.current = null
+      // Loading may still be in progress when StrictMode or navigation unmounts.
+      ready.catch(() => {}).then(() => sampler.dispose())
+      clearTimeout(previewTimerRef.current)
     }
   }, [])
 
-  // Preload Verovio WASM module eagerly (so first render is fast)
-  useEffect(() => {
-    createVerovioModule()
-      .then((mod) => { vrvModuleRef.current = mod })
-      .catch((err) => console.error('[Verovio] WASM preload failed:', err))
-    return () => {
-      vrvRef.current?.destroy()
-      vrvRef.current = null
-    }
+  useEffect(() => () => {
+    vrvRef.current?.destroy()
+    vrvRef.current = null
   }, [])
 
   // Preload Basic Pitch model when mic mode is selected
@@ -309,238 +334,93 @@ function App() {
     })
   }, [])
 
-  // ---------------------------------------------------------------------------
-  // Parse MusicXML timeline whenever musicXml changes
-  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!musicXml) {
-      setNoteTimeline([])
-      return
-    }
-    const xmlStr = decodeToXmlStr(musicXml)
-    if (xmlStr && typeof xmlStr === 'string') {
-      let cancelled = false
-      parseNoteTimelineOSMD(xmlStr, { defaultBpm })
-        .then(({ timeline, tempoMap }) => {
-          if (cancelled) return
-          setNoteTimeline(timeline)
-          setCurrentNoteIndex(0)
-          tempoMapRef.current = tempoMap
-          baseTimelineRef.current = { timeline, tempoMap }
-          if (tempoMap && tempoMap.length > 0) {
-            setBpm(tempoMap[0].bpm)
-            setScoreBpm(tempoMap[0].bpm)
-          }
-          pushDebug('osmdParsed', {
-            count: timeline.length,
-            bpm: tempoMap?.[0]?.bpm,
-            first3: timeline.slice(0, 3).map(e => ({ tick: e.tick, measure: e.measure, notes: e.notes })),
-          })
-        })
-        .catch((err) => {
-          console.error('[OSMD Parse]', err)
-          if (!cancelled) setNoteTimeline([])
-        })
-      return () => { cancelled = true }
-    }
-  }, [musicXml, pushDebug, defaultBpm])
+    const query = window.matchMedia(PORTRAIT_QUERY)
+    const update = () => setOrientation(screenOrientation())
+    query.addEventListener('change', update)
+    return () => query.removeEventListener('change', update)
+  }, [])
 
-  // ---------------------------------------------------------------------------
-  // Verovio — render MusicXML to SVG
-  // ---------------------------------------------------------------------------
   useEffect(() => {
-    if (!musicXml) {
-      if (svgContainerRef.current) svgContainerRef.current.innerHTML = ''
-      return
-    }
-
+    if (!musicXml) return
     let cancelled = false
-    const xmlStr = decodeToXmlStr(musicXml)
-    if (!xmlStr || typeof xmlStr !== 'string') return
-
+    setScore(null)
+    setLayout(null)
     setLoading(true)
     setError(null)
+    setPage(1)
+    setSelectedBarId(null)
+    setPositioned(false)
+    setCurrentNoteIndex(0)
+    setHand('both')
+    setSwapHands(false)
+    setBpm(null)
 
-    async function render() {
-      // Initialize WASM module if not already done
-      if (!vrvModuleRef.current) {
-        vrvModuleRef.current = await createVerovioModule()
-      }
+    async function loadScore() {
+      const xml = decodeToXmlStr(musicXml)
+      if (!xml) throw new Error('Invalid MusicXML or MXL')
+      vrvModuleRef.current ??= createVerovioModule()
+      const wasm = await vrvModuleRef.current
       if (cancelled) return
-
-      // Create toolkit once and reuse
-      if (!vrvRef.current) {
-        vrvRef.current = new VerovioToolkit(vrvModuleRef.current)
-      }
-
-      const tk = vrvRef.current
-      tk.setOptions({
+      vrvRef.current ??= new VerovioToolkit(wasm)
+      const toolkit = vrvRef.current
+      const initialOrientation = screenOrientation()
+      toolkit.setOptions({
         svgViewBox: true,
-        adjustPageHeight: true,
-        breaks: 'smart',  // respects injected <print new-system> breaks
+        ...scorePageSize(initialOrientation),
+        breaks: 'smart',
         pageMarginTop: 25,
         pageMarginBottom: 25,
         pageMarginLeft: 50,
         pageMarginRight: 50,
       })
-
-      // Inject system breaks at time-sig changes so measures never split across lines
-      tk.loadData(injectSystemBreaksAtTimeSigChange(xmlStr))
-
-      const pageCount = tk.getPageCount()
-      let svgHtml = ''
-      for (let p = 1; p <= pageCount; p++) {
-        svgHtml += tk.renderToSVG(p)
-      }
-
-      if (cancelled || !svgContainerRef.current) return
-      // Verovio SVG is generated by a trusted C++ renderer — user-provided MusicXML
-      // is parsed internally and never passed through to the SVG output as-is,
-      // so there is no XSS risk from skipping sanitization here.
-      svgContainerRef.current.innerHTML = svgHtml
-
-      // Build cursor schedule from Verovio's timemap (for visual highlighting only).
-      // Audio pitches come from OSMD noteTimeline to ensure correct flat note MIDI values.
-      try {
-        tk.renderToMIDI()  // populates getMIDIValuesForElement data needed for cursor IDs
-        const timemap = tk.renderToTimemap()
-        const cursorEvents = []  // {tstampMs, ids[]} — bypasses getElementsAtTime for cursor
-        for (const ev of timemap) {
-          const tstampMs = ev.tstamp ?? 0
-          const noteIds = []
-          for (const id of (ev.on || [])) {
-            try {
-              const midi = tk.getMIDIValuesForElement(id)
-              if (!midi || !(midi.pitch > 0)) continue
-              noteIds.push(id)
-            } catch {}
-          }
-          if (noteIds.length > 0) cursorEvents.push({ tstampMs, ids: noteIds })
-        }
-        cursorEvents.sort((a, b) => a.tstampMs - b.tstampMs)
-        vrvCursorScheduleRef.current = cursorEvents.length > 0 ? cursorEvents : null
-        pushDebug('vrvSchedule', {
-          cursorCount: cursorEvents.length,
-          timemapLen: timemap.length,
-        })
-      } catch (err) {
-        console.warn('[Verovio] timemap failed:', err)
-        pushDebug('vrvScheduleErr', { err: String(err) })
-      }
-
+      const source = preparePlaybackScore(injectSystemBreaksAtTimeSigChange(xml))
+      if (!toolkit.loadData(source.xml)) throw new Error('Could not load MusicXML')
+      const pageCount = toolkit.getPageCount()
+      if (!pageCount) throw new Error('No score pages')
+      const playback = collectScorePlayback(toolkit, source)
+      setScore({ ...playback, toolkit })
+      setLayout(indexScorePages(toolkit, playback.measureIds, initialOrientation))
+      pushDebug('scoreLoaded', { pages: pageCount, notes: playback.notes.length, bars: playback.bars.length })
       setLoading(false)
     }
 
-    render().catch((err) => {
-      console.error('[Verovio]', err)
-      if (!cancelled) {
-        setError('Failed to render sheet music. Check the file format.')
-        setLoading(false)
-      }
+    loadScore().catch(error => {
+      if (cancelled) return
+      console.error('[Score]', error)
+      setError('Could not open this score. Check the MusicXML or MXL file.')
+      setLoading(false)
     })
-
     return () => { cancelled = true }
-  }, [musicXml])
+  }, [musicXml, pushDebug])
 
-  // (Speed and tempo overrides are applied at listen-start time via timeSec scheduling; no mid-listen update needed)
+  useLayoutEffect(() => {
+    if (!score || !layout || layout.orientation === orientation) return
+    const { toolkit, measureIds } = score
+    toolkit.setOptions(scorePageSize(orientation))
+    toolkit.redoLayout()
+    const nextLayout = indexScorePages(toolkit, measureIds, orientation)
+    setPage(nextLayout.pageByBarId.get(pageAnchorId) ?? Math.min(page, nextLayout.pageCount))
+    setLayout(nextLayout)
+  }, [score, layout, orientation, page, pageAnchorId])
 
-  // Sync Verovio cursor when note index changes (practice mode)
+  useLayoutEffect(() => {
+    if (!score || !layout) {
+      setPageSvg('')
+      return
+    }
+    if (layout.orientation !== orientation || page > layout.pageCount) return
+    if (!layout.pages.has(page)) {
+      const svg = score.toolkit.renderToSVG(page)
+      layout.pages.set(page, DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true }, ADD_TAGS: ['use'] }))
+    }
+    setPageSvg(layout.pages.get(page))
+  }, [score, layout, orientation, page])
+
+  const followingPage = autoPage && hasPlaybackPosition ? visibleBarPage : null
   useEffect(() => {
-    if (mode !== 'practice') return
-
-    const entry = noteTimeline[currentNoteIndex]
-    if (!entry) return
-
-    if (lastTickSetRef.current !== entry.tick) {
-      lastTickSetRef.current = entry.tick
-      const ms = entry.cursorSec != null
-        ? entry.cursorSec * 1000
-        : entry.timeSec != null
-          ? entry.timeSec * 1000
-          : tickToSec(entry.tick, tempoMapRef.current) * 1000
-      if (!highlightVerovioFromSchedule(ms, 'instant')) {
-        highlightVerovioAtMs(ms, 'instant')
-      }
-    }
-  }, [mode, currentNoteIndex, noteTimeline])
-
-  // ---------------------------------------------------------------------------
-  // Verovio cursor helpers
-  // ---------------------------------------------------------------------------
-  function clearVerovioHighlights() {
-    svgContainerRef.current?.querySelectorAll('.current-note').forEach((el) => {
-      el.classList.remove('current-note')
-    })
-  }
-
-  // Highlight via the prebuilt Verovio timemap schedule instead of
-  // getElementsAtTime(): that API carries float error in its internal
-  // timestamps, so querying an exact note onset can resolve to the previous
-  // event (measure-start notes get skipped) or return two events at once.
-  // The schedule uses the timemap's own tstamps, so matching is exact.
-  function highlightVerovioFromSchedule(ms, scrollBehavior = 'smooth') {
-    const cs = vrvCursorScheduleRef.current
-    const container = svgContainerRef.current
-    if (!cs || cs.length === 0 || !container) return false
-
-    let bestIdx = -1
-    for (let i = 0; i < cs.length; i++) {
-      if (cs[i].tstampMs <= ms + 20) bestIdx = i
-      else break
-    }
-    if (bestIdx < 0) return false
-
-    clearVerovioHighlights()
-    const { ids } = cs[bestIdx]
-    for (const id of ids) {
-      const el = container.querySelector(`#${id}`)
-      if (el) el.classList.add('current-note')
-    }
-
-    if (autoscrollRef.current && ids.length > 0) {
-      const firstEl = container.querySelector(`#${ids[0]}`)
-      if (firstEl) {
-        requestAnimationFrame(() => {
-          const rect = firstEl.getBoundingClientRect()
-          const viewportH = window.innerHeight
-          if (rect.bottom > viewportH - 40 || rect.top < 80) {
-            firstEl.scrollIntoView({ block: 'center', behavior: scrollBehavior })
-          }
-        })
-      }
-    }
-    return true
-  }
-
-  function highlightVerovioAtMs(ms, scrollBehavior = 'smooth') {
-    const tk = vrvRef.current
-    const container = svgContainerRef.current
-    if (!tk || !container) return
-
-    clearVerovioHighlights()
-
-    try {
-      const result = tk.getElementsAtTime(Math.round(ms))
-      const ids = [...(result.notes || []), ...(result.chords || [])]
-      for (const id of ids) {
-        const el = container.querySelector(`#${id}`)
-        if (el) el.classList.add('current-note')
-      }
-
-      if (autoscrollRef.current && ids.length > 0) {
-        const firstEl = container.querySelector(`#${ids[0]}`)
-        if (firstEl) {
-          requestAnimationFrame(() => {
-            const rect = firstEl.getBoundingClientRect()
-            const viewportH = window.innerHeight
-            if (rect.bottom > viewportH - 40 || rect.top < 80) {
-              firstEl.scrollIntoView({ block: 'center', behavior: scrollBehavior })
-            }
-          })
-        }
-      }
-    } catch {}
-  }
+    if (followingPage > 0) setPage(followingPage)
+  }, [followingPage])
 
   // ---------------------------------------------------------------------------
   // Practice mode: advance on correct input
@@ -563,16 +443,16 @@ function App() {
 
   // Play the target note(s) via SplendidGrandPiano as a hint
   const playTargetHint = useCallback(() => {
-    const piano = toneSamplerRef.current
+    const piano = pianoRef.current
     const target = noteTimelineRef.current[currentNoteIndexRef.current]
     if (!piano || !target) return
-    Tone.start().then(() => {
-      const time = Tone.getContext().rawContext.currentTime
+    Promise.all([Tone.start(), piano.ready]).then(() => {
+      if (modeRef.current !== 'practice' || noteTimelineRef.current[currentNoteIndexRef.current] !== target) return
       for (const noteName of target.notes) {
         const midi = noteNameToMidi(noteName)
-        if (midi !== null) piano.start({ note: midi, time, duration: 1.5 })
+        if (midi !== null) piano.sampler.start({ note: midi, duration: 1.5 })
       }
-    })
+    }).catch(error => console.error('[Piano hint]', error))
   }, [])
 
   // ---- Step timing ---------------------------------------------------------
@@ -725,12 +605,12 @@ function App() {
       if (modeRef.current === 'practice' && !pausedRef.current && !completedRef.current) {
         handlePausePractice()
       } else if (modeRef.current === 'listen' && !pausedRef.current) {
-        handleListenPause()
+        pausePlayback()
       }
     }
     document.addEventListener('visibilitychange', onVisibility)
     return () => document.removeEventListener('visibilitychange', onVisibility)
-  }, [])
+  }, [pausePlayback])
 
   // Android back: the practice screen is state, not a route. While a score is
   // open we push a history entry so the system back button lands on home.
@@ -748,11 +628,10 @@ function App() {
     return () => window.removeEventListener('popstate', onPop)
   }, [])
 
-  function stopToneListenLoop() {
-    if (toneListenRafRef.current) {
-      cancelAnimationFrame(toneListenRafRef.current)
-      toneListenRafRef.current = null
-    }
+  function clearPreview() {
+    previewRequestRef.current++
+    clearTimeout(previewTimerRef.current)
+    setPreviewNote(null)
   }
 
   function stopAllInputs() {
@@ -764,13 +643,8 @@ function App() {
     wrongTimerRef.current = null
     heldNotesRef.current.clear()
     resetStepState()
-    stopToneListenLoop()
-    Tone.getTransport().stop()
-    Tone.getTransport().cancel()
-    tonePartRef.current?.dispose()
-    tonePartRef.current = null
-    toneSamplerRef.current?.stop()
-    clearVerovioHighlights()
+    clearPreview()
+    player.stop()
   }
 
   // ---------------------------------------------------------------------------
@@ -826,41 +700,21 @@ function App() {
     setMusicXml(null)
     setFilename('')
     setError(null)
-    setNoteTimeline([])
-    setMode('idle')
-    setPaused(false)
+    setScore(null)
+    setLayout(null)
+    setPositioned(false)
+    setPracticing(false)
+    setPracticePaused(false)
     setCurrentNoteIndex(0)
     setDetectedNote(null)
     setInputError(null)
     setCompleted(false)
     setShowHint(false)
     setBpm(null)
-    setScoreBpm(null)
-    baseTimelineRef.current = null
-    setPlayerProgress(0)
-    if (svgContainerRef.current) {
-      svgContainerRef.current.innerHTML = ''
-    }
   }
 
-  // Apply a user-chosen BPM by scaling the parsed timeline's absolute times.
-  // cursorSec is intentionally left at score tempo — Verovio's timemap is in
-  // score-tempo milliseconds, and the cursor lookup depends on that.
-  // Like playback speed, the change takes effect the next time listen starts.
   function handleBpmChange(newBpm) {
-    const clamped = Math.min(240, Math.max(30, Math.round(newBpm)))
-    setBpm(clamped)
-    const base = baseTimelineRef.current
-    if (!base || !scoreBpm) return
-    const ratio = clamped / scoreBpm
-    tempoMapRef.current = base.tempoMap.map((te) => ({ tick: te.tick, bpm: te.bpm * ratio }))
-    setNoteTimeline(
-      base.timeline.map((e) => ({
-        ...e,
-        timeSec: e.timeSec != null ? e.timeSec / ratio : e.timeSec,
-        durationSec: e.durationSec != null ? e.durationSec / ratio : e.durationSec,
-      }))
-    )
+    setBpm(Math.min(240, Math.max(30, Math.round(newBpm))))
   }
 
   function commitBpmInput() {
@@ -869,7 +723,7 @@ function App() {
       handleBpmChange(n)
       setBpmInput(String(Math.min(240, Math.max(30, Math.round(n)))))
     } else {
-      setBpmInput(bpm != null ? String(bpm) : '')
+      setBpmInput((bpm ?? scoreBpm) != null ? String(Math.round(bpm ?? scoreBpm)) : '')
     }
   }
 
@@ -884,142 +738,80 @@ function App() {
     }
   }
 
-  // ---------------------------------------------------------------------------
-  // Tone.js cursor sync loop (rAF — reads transport.seconds, drives Verovio cursor)
-  // ---------------------------------------------------------------------------
-  function startToneListenLoop() {
-    stopToneListenLoop()
+  function startListen(start = player.position) {
+    if (!score || !playNotes.length) return
+    clearPreview()
+    setInputError(null)
+    const position = start >= score.duration ? 0 : start
+    const bar = playbackFrameAt(frames, position)?.bar
+    const playbackPage = layout?.pageByBarId.get(bar?.id)
+    if (playbackPage) setPage(playbackPage)
+    player.play({
+      start: position,
+      notes: playNotes,
+      duration: score.duration,
+      rate: tempoRate * playbackSpeed,
+    }).catch(error => {
+      console.error('[Playback]', error)
+      setInputError('Could not play the piano sound.')
+    })
+  }
 
-    function frame() {
-      // transport.bpm = 60, so transport.seconds ≈ wall-clock seconds elapsed
-      const wallSec = Tone.getTransport().seconds
-      const speed = playbackSpeedRef.current
-      const musicalSec = wallSec * speed  // position in original-tempo seconds
-      const totalWallSec = listenEndWallSecRef.current
-      const totalMusicalSec = listenTotalMusicalSecRef.current
-
-      // Find current note in OSMD timeline by audio time (timeSec = unfolded time).
-      const tl = noteTimelineRef.current
-      let best = 0
-      for (let i = 0; i < tl.length; i++) {
-        if ((tl[i].timeSec ?? 0) <= musicalSec) best = i
-        else break
-      }
-      setCurrentNoteIndex(best)
-
-      // Highlight current note in Verovio SVG.
-      // Use cursorSec (original-score time) so cursor works correctly on repeat passes.
-      const cursorMs = (tl[best]?.cursorSec ?? tl[best]?.timeSec ?? musicalSec) * 1000
-      if (!highlightVerovioFromSchedule(cursorMs)) {
-        highlightVerovioAtMs(cursorMs)
-      }
-
-      // Progress bar
-      if (totalMusicalSec > 0) setPlayerProgress(Math.min(1, musicalSec / totalMusicalSec))
-
-      // Completion
-      if (totalWallSec > 0 && wallSec >= totalWallSec) {
-        toneListenRafRef.current = null
-        Tone.getTransport().stop()
-        Tone.getTransport().cancel()
-        tonePartRef.current?.dispose()
-        tonePartRef.current = null
-        clearVerovioHighlights()
-        setMode('idle')
-        setCompleted(true)
-        setPlayerProgress(1)
-        return
-      }
-
-      toneListenRafRef.current = requestAnimationFrame(frame)
+  function seekScore(position) {
+    clearPreview()
+    player.seek(position)
+    setPositioned(true)
+    const bar = playbackFrameAt(frames, position)?.bar
+    const playbackPage = layout?.pageByBarId.get(bar?.id)
+    if (playbackPage) {
+      setPage(playbackPage)
+      setSelectedBarId(bar.id)
     }
-    toneListenRafRef.current = requestAnimationFrame(frame)
   }
 
-  // ---------------------------------------------------------------------------
-  // Listen mode — Tone.js Transport + Sampler for audio, rAF loop for cursor
-  // ---------------------------------------------------------------------------
-  async function handleListen() {
-    if (mode === 'listen') {
-      stopToneListenLoop()
-      Tone.getTransport().stop()
-      Tone.getTransport().cancel()
-      tonePartRef.current?.dispose()
-      tonePartRef.current = null
-      clearVerovioHighlights()
-      setMode('idle')
-      return
+  function turnPage(direction) {
+    clearPreview()
+    if (mode !== 'idle') setAutoPage(false)
+    setPage(Math.min(layout.pageCount, Math.max(1, page + direction)))
+    setSelectedBarId(null)
+  }
+
+  function handleScoreClick(noteId, barId, position) {
+    if (mode === 'practice') {
+      clearPreview()
+      handlePausePractice()
+      resetStepState()
+      if (position != null) {
+        const next = noteTimeline.findIndex(entry => entry.start >= position - 0.0001)
+        setCurrentNoteIndex(next < 0 ? noteTimeline.length - 1 : next)
+        setDetectedNote(null)
+      }
+    } else if (position != null) {
+      seekScore(position)
+    } else {
+      if (mode === 'listen') player.pause()
+      clearPreview()
     }
-
-    if (noteTimeline.length === 0) return
-
-    const piano = toneSamplerRef.current
-    if (!piano) return
-
-    // Unlock AudioContext on user gesture
-    await Tone.start()
-
-    // Full reset before scheduling
-    Tone.getTransport().stop()
-    Tone.getTransport().cancel()
-    tonePartRef.current?.dispose()
-    tonePartRef.current = null
-
-    // Set transport to BPM=60 so transport.seconds == wall-clock seconds.
-    // Notes are scheduled in absolute seconds derived from OSMD's tempo-aware timeSec,
-    // which correctly handles all mid-piece tempo and time-signature changes.
-    const transport = Tone.getTransport()
-    const speed = playbackSpeedRef.current
-    transport.bpm.value = 60
-    transport.position = 0
-
-    // Use OSMD noteTimeline for audio — correct flat MIDI via getHalfTone()
-    const events = noteTimeline.flatMap((entry) =>
-      entry.notes.flatMap((name) => {
-        const midi = noteNameToMidi(name)
-        if (!midi) return []
-        return [[
-          (entry.timeSec ?? 0) / speed,
-          { note: midi, durationSec: Math.max(entry.durationSec ?? 0.1, 0.05) / speed },
-        ]]
-      })
-    )
-
-    // Total musical duration for completion detection and progress bar
-    const last = noteTimeline[noteTimeline.length - 1]
-    const totalMusicalSec = last ? (last.timeSec ?? 0) + (last.durationSec ?? 0.1) : 0
-    pushDebug('listenStart', { evCount: events.length, totalMusicalSec })
-    listenTotalMusicalSecRef.current = totalMusicalSec
-    listenEndWallSecRef.current = totalMusicalSec / speed
-
-    // Schedule all notes via Tone.Part using AudioContext time
-    const part = new Tone.Part((time, event) => {
-      piano.start({ note: event.note, time, duration: event.durationSec })
-    }, events)
-    part.start(0)
-    tonePartRef.current = part
-
-    setMode('listen')
-    setCurrentNoteIndex(0)
-    setCompleted(false)
-    setPaused(false)
-    setPlayerProgress(0)
-    lastTickSetRef.current = -1
-
-    transport.start()
-    startToneListenLoop()
+    if (barId) setSelectedBarId(barId)
+    const note = score?.notesById.get(noteId)
+    if (!note) return
+    const request = previewRequestRef.current
+    player.audition(note.midi, PREVIEW_SECONDS).then(played => {
+      if (!played || request !== previewRequestRef.current) return
+      setPreviewNote(note)
+      previewTimerRef.current = setTimeout(() => setPreviewNote(null), PREVIEW_SECONDS * 1000)
+    }).catch(error => {
+      if (request !== previewRequestRef.current) return
+      console.error('[Piano preview]', error)
+      setInputError('Could not play the piano sound.')
+    })
   }
 
-  function handleListenPause() {
-    Tone.getTransport().pause()
-    stopToneListenLoop()
-    setPaused(true)
-  }
-
-  function handleListenResume() {
-    Tone.getTransport().start()
-    startToneListenLoop()
-    setPaused(false)
+  function selectHand(nextHand) {
+    clearPreview()
+    if (mode === 'listen') player.pause()
+    else player.seek(player.position)
+    setHand(nextHand)
   }
 
   // ---------------------------------------------------------------------------
@@ -1028,14 +820,15 @@ function App() {
   async function handleStartPractice() {
     if (noteTimeline.length === 0) return
 
+    clearPreview()
+    player.stop()
     setCurrentNoteIndex(0)
     setDetectedNote(null)
     setInputError(null)
     setCompleted(false)
-    setPaused(false)
+    setPracticePaused(false)
     setShowHint(false)
-    setMode('practice')
-    lastTickSetRef.current = -1
+    setPracticing(true)
     resetStepState()
 
     if (inputMode === 'midi' && !isMobile) {
@@ -1045,7 +838,7 @@ function App() {
             ? 'MIDI requires Chrome or Edge. Switch to Microphone in settings.'
             : 'Connect a MIDI keyboard via USB to start.'
         )
-        setMode('idle')
+        setPracticing(false)
         return
       }
       const stop = await listenToDevice(
@@ -1061,7 +854,7 @@ function App() {
         stopListenerRef.current = stop
       } else {
         setInputError('Failed to connect to MIDI device. Try reconnecting.')
-        setMode('idle')
+        setPracticing(false)
       }
     } else {
       try {
@@ -1073,15 +866,15 @@ function App() {
             ? 'Microphone access was blocked. Grant permission and try again.'
             : `Could not start mic: ${err?.message || 'unknown error'}`
         )
-        setMode('idle')
+        setPracticing(false)
       }
     }
   }
 
   function handleStopPractice() {
     stopAllInputs()
-    setMode('idle')
-    setPaused(false)
+    setPracticing(false)
+    setPracticePaused(false)
     setDetectedNote(null)
     setCompleted(false)
     setShowHint(false)
@@ -1093,7 +886,7 @@ function App() {
       clearTimeout(w.timer)
       stepWaitRef.current = { idx: w.idx, remaining: Math.max(0, w.due - performance.now()) }
     }
-    setPaused(true)
+    setPracticePaused(true)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
     setShowHint(false)
@@ -1102,7 +895,7 @@ function App() {
   function handleResumePractice() {
     const w = stepWaitRef.current
     if (w && !w.timer) scheduleStepWait(w.idx, performance.now() + w.remaining)
-    setPaused(false)
+    setPracticePaused(false)
     // Reopen the mic if it was released while the app was backgrounded.
     if (inputMode === 'mic' && !stopMicRef.current) {
       startMicDetection().catch((err) => {
@@ -1116,22 +909,19 @@ function App() {
     setCompleted(false)
     setCurrentNoteIndex(0)
     setDetectedNote(null)
-    setPaused(false)
+    setPracticePaused(false)
     setShowHint(false)
     clearTimeout(wrongTimerRef.current)
     wrongTimerRef.current = null
-    lastTickSetRef.current = -1
   }
 
   // Navigation
   function handlePrevMoment() {
-    lastTickSetRef.current = -1
     resetStepState()
     setCurrentNoteIndex((i) => Math.max(0, i - 1))
   }
 
   function handleNextMoment() {
-    lastTickSetRef.current = -1
     resetStepState()
     setCurrentNoteIndex((i) => Math.min(noteTimeline.length - 1, i + 1))
   }
@@ -1142,7 +932,6 @@ function App() {
     if (target < 1) return
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
-      lastTickSetRef.current = -1
       resetStepState()
       setCurrentNoteIndex(idx)
     }
@@ -1153,7 +942,6 @@ function App() {
     const target = curMeasure + 1
     const idx = noteTimeline.findIndex((m) => m.measure === target)
     if (idx !== -1) {
-      lastTickSetRef.current = -1
       resetStepState()
       setCurrentNoteIndex(idx)
     }
@@ -1162,7 +950,6 @@ function App() {
   // ---------------------------------------------------------------------------
   // Derived display values
   // ---------------------------------------------------------------------------
-  const currentEntry = noteTimeline[currentNoteIndex]
   const currentNoteDisplay = currentEntry ? currentEntry.notes.join(' + ') : '---'
   const totalMeasures = noteTimeline.length > 0 ? noteTimeline[noteTimeline.length - 1].measure : 0
   const isMatch = mode === 'practice' && detectedNote && currentEntry &&
@@ -1289,7 +1076,7 @@ function App() {
               <button
                 onClick={() => setShowHomeSettings(false)}
                 className="w-8 h-8 flex items-center justify-center rounded-lg transition-colors cursor-pointer"
-                style={{border:'1px solid var(--border)',background:'rgba(0,255,200,0.04)',color:'var(--sub)'}}
+                style={{border:'1px solid var(--border)',background:'var(--bg)',color:'var(--sub)'}}
               >
                 <svg width="14" height="14" viewBox="0 0 20 20" fill="none">
                   <path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
@@ -1374,9 +1161,9 @@ function App() {
             PRACTICE / LISTEN SCREEN (musicXml loaded)
         ════════════════════════════════════════════════════════ */}
         {musicXml && (
-          <div className="relative z-10 flex flex-col items-center px-4 sm:px-6 pt-4 sm:pt-6 pb-4 h-full overflow-y-auto [@media(max-height:500px)]:pt-2">
+          <div className="score-reader relative z-10 flex h-full flex-col items-center gap-2 px-3 py-2 sm:px-5">
             {/* Thin top bar */}
-            <div className="w-full max-w-4xl flex items-center justify-between mb-6 pb-4 [@media(max-height:500px)]:mb-2 [@media(max-height:500px)]:pb-2" style={{borderBottom:'1px solid var(--border)'}}>
+            <div className="w-full max-w-6xl flex shrink-0 items-center justify-between gap-2 pb-1" style={{borderBottom:'1px solid var(--border)'}}>
               {/* Left: back + filename */}
               <div className="flex items-center gap-3 min-w-0">
                 <button
@@ -1391,7 +1178,7 @@ function App() {
                 </button>
                 <div className="flex items-center gap-2 min-w-0">
                   <span className="text-sm font-medium truncate" style={{color:'var(--ink)'}}>{filename}</span>
-                  {bpm && <span className="text-xs font-mono shrink-0" style={{color:'var(--sub)'}}>{bpm} BPM</span>}
+                  {scoreBpm && <span className="text-xs font-mono shrink-0" style={{color:'var(--sub)'}}>{Math.round(bpm ?? scoreBpm)} BPM</span>}
                 </div>
               </div>
 
@@ -1411,22 +1198,13 @@ function App() {
                   </button>
                 )}
 
-                {/* Listen button */}
                 {mode !== 'practice' && (
                   <button
-                    onClick={handleListen}
-                    disabled={noteTimeline.length === 0}
-                    className="w-8 h-8 md:w-10 md:h-10 flex items-center justify-center rounded-lg transition-colors cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
-                    style={mode === 'listen'
-                      ? {border:'1px solid var(--accent)',background:'rgba(0,255,200,0.1)',color:'var(--accent)'}
-                      : {border:'1px solid var(--border)',color:'var(--sub)'}}
-                    aria-label={mode === 'listen' ? 'Stop' : 'Listen'}
+                    className="score-control"
+                    disabled={!playNotes.length}
+                    onClick={() => mode === 'listen' && !paused ? player.pause() : startListen()}
                   >
-                    {mode === 'listen' ? (
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
-                    ) : (
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-                    )}
+                    {mode === 'idle' ? 'Listen' : paused ? 'Resume' : 'Pause'}
                   </button>
                 )}
 
@@ -1482,7 +1260,7 @@ function App() {
             )}
 
             {/* Input status */}
-            <div className="w-full max-w-4xl mb-4 [@media(max-height:500px)]:mb-1.5 flex items-center gap-2 text-xs" style={{color:'var(--sub)'}}>
+            <div className="w-full max-w-6xl flex shrink-0 items-center gap-2 text-xs" style={{color:'var(--sub)'}}>
               {inputMode === 'mic' ? (
                 <>
                   <span className={`inline-block w-1.5 h-1.5 rounded-full ${modelLoading ? 'animate-pulse' : ''}`} style={{background:'var(--accent)'}} />
@@ -1508,10 +1286,10 @@ function App() {
             </div>
 
             {/* Sheet + practice panel wrapper */}
-            <div className="relative w-full max-w-4xl">
+            <div className="relative flex min-h-0 w-full max-w-6xl flex-1 flex-col">
               {/* Practice panel */}
               {mode === 'practice' && currentEntry && !completed && !paused && (
-                <div className="sticky top-0 z-20 rounded-xl backdrop-blur-md px-4 sm:px-6 py-3 mb-3 shadow-xl shadow-black/40" style={{border:'1px solid var(--border)',backgroundColor:'oklch(0.12 0.025 270 / 0.93)'}}>
+                <div className="shrink-0 rounded-xl px-3 py-1 mb-1" style={{border:'1px solid var(--border)',backgroundColor:'oklch(0.12 0.025 270 / 0.93)'}}>
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3 sm:gap-4">
                       {/* Note arrows */}
@@ -1569,32 +1347,28 @@ function App() {
                 </div>
               )}
 
-              {/* Verovio rendered sheet music */}
-              <div
-                ref={svgContainerRef}
-                className="bg-white rounded-2xl p-3 sm:p-6 min-h-[160px] sm:min-h-[200px] overflow-x-auto shadow-2xl"
-              />
-
-              {loading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-white/80 rounded-2xl">
-                  <div className="flex items-center gap-3" style={{color:'var(--sub)'}}>
-                    <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    <span className="text-sm">Rendering score...</span>
+              <div className="score-sheet-area">
+                <ScorePage
+                  svg={pageSvg}
+                  activeNotes={scoreHighlights}
+                  selectedBarId={selectedBarId}
+                  swapHands={swapHands}
+                  onScoreClick={handleScoreClick}
+                  cursorBar={hasPlaybackPosition ? visibleBar ?? null : null}
+                  cursorTime={practicing ? currentEntry?.start ?? 0 : player.position}
+                  bars={score?.bars}
+                  notesById={score?.notesById}
+                />
+                {(loading || error) && (
+                  <div className="absolute inset-0 grid place-items-center rounded-xl bg-white/90 px-4 text-center text-sm text-slate-700">
+                    {error || 'Rendering score…'}
                   </div>
-                </div>
-              )}
-              {error && (
-                <div className="absolute inset-0 flex items-center justify-center bg-white/80 rounded-2xl">
-                  <p className="text-red-500 text-sm">{error}</p>
-                </div>
-              )}
+                )}
+              </div>
 
               {/* Completion */}
               {completed && (
-                <div className="mt-4 rounded-2xl backdrop-blur-sm px-6 sm:px-8 py-10 text-center" style={{border:'1px solid rgba(0,255,200,0.2)',background:'rgba(0,255,200,0.04)'}}>
+                <div className="absolute inset-0 z-20 grid content-center rounded-2xl px-6 py-3 text-center" style={{border:'1px solid rgba(0,255,200,0.2)',background:'var(--bg)'}}>
                   <div className="text-5xl mb-4">🎹</div>
                   <p className="text-2xl font-bold mb-2" style={{color:'var(--ink)'}}>You finished!</p>
                   <p className="text-sm mb-1" style={{color:'var(--sub)'}}>{filename}</p>
@@ -1612,6 +1386,51 @@ function App() {
                 </div>
               )}
             </div>
+
+            {score && layout && (
+              <div className="w-full max-w-6xl shrink-0">
+                <div className="score-toolbar mb-1">
+                  <div className="flex items-center gap-2">
+                    <button className="score-control" aria-label="Previous page" disabled={page <= 1} onClick={() => turnPage(-1)}>{chevronLeft}</button>
+                    <span className="tabular-nums">Page {page} / {layout.pageCount}</span>
+                    <button className="score-control" aria-label="Next page" disabled={page >= layout.pageCount} onClick={() => turnPage(1)}>{chevronRight}</button>
+                    <label className="flex items-center gap-1">
+                      <input type="checkbox" checked={autoPage} onChange={event => setAutoPage(event.target.checked)} />
+                      Auto turn
+                    </label>
+                  </div>
+                  {mode !== 'practice' && (
+                    <div className="flex items-center gap-2">
+                      {score.hasHands && (
+                        <select className="score-control" aria-label="Playback hand" value={hand} onChange={event => selectHand(event.target.value)}>
+                          <option value="both">Both hands</option>
+                          <option value="left">Left hand</option>
+                          <option value="right">Right hand</option>
+                        </select>
+                      )}
+                      <button className="score-control" disabled={!selectedBar || !playNotes.length} onClick={() => startListen(selectedBar.time)}>
+                        {selectedBar ? 'Play from bar ' + (selectedBar.label ?? selectedBar.index) : 'Play from bar'}
+                      </button>
+                      {mode === 'listen' && <button className="score-control" onClick={() => { clearPreview(); setPositioned(false); player.stop() }}>Stop</button>}
+                    </div>
+                  )}
+                </div>
+                {mode !== 'practice' && (
+                  <input
+                    className="score-position"
+                    type="range"
+                    aria-label="Playback position"
+                    min="0"
+                    max={score.duration || 1}
+                    step="0.01"
+                    value={Math.min(player.position, score.duration)}
+                    disabled={!playNotes.length}
+                    onChange={event => seekScore(Number(event.target.value))}
+                  />
+                )}
+                <ScoreKeyboard notes={activeNotes} swapHands={swapHands} />
+              </div>
+            )}
           </div>
         )}
 
@@ -1781,8 +1600,8 @@ function App() {
                       style={{background:'var(--bg)',border:'1px solid var(--border)',color:'var(--ink)'}}
                     />
                     <span className="text-xs" style={{color:'var(--sub)',opacity:.6}}>30–240</span>
-                    {scoreBpm != null && bpm !== scoreBpm && (
-                      <button onClick={() => handleBpmChange(scoreBpm)} className="ml-auto text-xs font-medium cursor-pointer" style={{color:'var(--accent)'}}>
+                    {bpm != null && bpm !== scoreBpm && (
+                      <button onClick={() => setBpm(null)} className="ml-auto text-xs font-medium cursor-pointer" style={{color:'var(--accent)'}}>
                         Reset to {scoreBpm}
                       </button>
                     )}
@@ -1800,17 +1619,12 @@ function App() {
                 </div>
               </div>
 
-              <div className="mb-5">
-                <button onClick={() => setAutoscroll((v) => !v)} className="flex items-center justify-between w-full p-3 rounded-xl transition-colors cursor-pointer" style={{border:'1px solid var(--border)'}}>
-                  <div className="text-left">
-                    <div className="text-sm font-medium" style={{color:'var(--ink)'}}>Autoscroll</div>
-                    <div className="text-xs mt-0.5" style={{color:'var(--sub)'}}>Keep the current bar visible during playback</div>
-                  </div>
-                  <div className="w-10 h-6 rounded-full relative transition-colors" style={{background: autoscroll ? 'var(--accent)' : 'var(--panel)'}}>
-                    <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${autoscroll ? 'left-5' : 'left-1'}`} />
-                  </div>
-                </button>
-              </div>
+              {score?.hasHands && (
+                <label className="mb-5 flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={swapHands} onChange={event => setSwapHands(event.target.checked)} />
+                  Swap left and right staves
+                </label>
+              )}
 
               {inputMode === 'mic' && (
                 <div className="mb-5">
@@ -1867,27 +1681,6 @@ function App() {
           <button onClick={() => setShowMicPrompt(false)} className="transition-colors cursor-pointer shrink-0" style={{color:'var(--sub)'}} aria-label="Dismiss"
             onMouseEnter={e=>e.currentTarget.style.color='var(--ink)'} onMouseLeave={e=>e.currentTarget.style.color='var(--sub)'}>
             <svg width="16" height="16" viewBox="0 0 20 20" fill="none"><path d="M15 5L5 15M5 5l10 10" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>
-          </button>
-        </div>
-      )}
-
-      {/* Floating playback controls — listen mode */}
-      {mode === 'listen' && (
-        <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 glass rounded-2xl px-4 py-3 shadow-2xl shadow-black/60" style={{borderColor:'var(--border)'}}>
-          <div className="text-xs font-mono mr-1" style={{color:'var(--sub)'}}>{currentNoteDisplay}</div>
-          <button onClick={paused ? handleListenResume : handleListenPause} className="w-9 h-9 flex items-center justify-center rounded-xl transition-colors cursor-pointer" style={{border:'1px solid var(--border)',color:'var(--ink)'}} aria-label={paused ? 'Resume' : 'Pause'}>
-            {paused ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
-            )}
-          </button>
-          <div className="w-24 h-0.5 rounded-full overflow-hidden" style={{background:'rgba(255,255,255,0.06)'}}>
-            <div className="h-full rounded-full transition-all duration-200" style={{ width: `${playerProgress * 100}%`, background:'var(--accent)' }} />
-          </div>
-          <span className="text-[10px] font-mono" style={{color:'var(--sub)',opacity:.6}}>{Math.round(playbackSpeed * 100)}%</span>
-          <button onClick={handleListen} className="w-9 h-9 flex items-center justify-center rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 hover:bg-red-500/20 hover:text-red-300 transition-colors cursor-pointer" aria-label="Stop">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
           </button>
         </div>
       )}

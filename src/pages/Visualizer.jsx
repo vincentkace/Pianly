@@ -7,6 +7,7 @@ import { DEMO_PIECES, loadDemoScore } from '../data/demoScores'
 import { SplendidGrandPiano } from 'smplr'
 import { enableMidi } from '../input/midiInput'
 import { isMobile } from '../lib/platform'
+import { BLACK_KEY_HEIGHT_RATIO, FIRST_MIDI, LAST_MIDI, WHITE_KEY_COUNT, buildKeyLayout } from '../utils/pianoLayout'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import Background from '../Background'
@@ -41,37 +42,7 @@ function ColorSwatches({ value, onChange }) {
 // ---------------------------------------------------------------------------
 // Piano keyboard layout
 // ---------------------------------------------------------------------------
-const FIRST_MIDI = 21  // A0
-const LAST_MIDI = 108  // C8
-const BLACK_KEY_SET = new Set([1, 3, 6, 8, 10])
 const WHITE_KEY_H_RATIO = 0.22
-const BLACK_KEY_H_RATIO = 0.6
-
-function isBlackKey(midi) {
-  return BLACK_KEY_SET.has(midi % 12)
-}
-
-let WHITE_KEY_COUNT = 0
-for (let m = FIRST_MIDI; m <= LAST_MIDI; m++) {
-  if (!isBlackKey(m)) WHITE_KEY_COUNT++
-}
-
-function buildKeyLayout(canvasWidth) {
-  const whiteW = canvasWidth / WHITE_KEY_COUNT
-  const blackW = whiteW * 0.65
-  const layout = {}
-  let wi = 0
-  for (let midi = FIRST_MIDI; midi <= LAST_MIDI; midi++) {
-    if (!isBlackKey(midi)) { layout[midi] = { x: wi * whiteW, width: whiteW, black: false }; wi++ }
-  }
-  for (let midi = FIRST_MIDI; midi <= LAST_MIDI; midi++) {
-    if (isBlackKey(midi)) {
-      const prev = layout[midi - 1]
-      if (prev) layout[midi] = { x: prev.x + prev.width - blackW / 2, width: blackW, black: true }
-    }
-  }
-  return layout
-}
 
 function darkenColor(hex, factor) {
   const r = parseInt(hex.slice(1, 3), 16)
@@ -450,7 +421,7 @@ export default function Visualizer() {
     let currentTimeSec = ps.elapsed
 
     const whiteKeyH = Math.max(h * WHITE_KEY_H_RATIO, 60)
-    const blackKeyH = whiteKeyH * BLACK_KEY_H_RATIO
+    const blackKeyH = whiteKeyH * BLACK_KEY_HEIGHT_RATIO
     const layout = buildKeyLayout(w)
     const keyboardTop = h - whiteKeyH
     // Everything below is in score seconds: one second of score is always

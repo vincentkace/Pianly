@@ -91,3 +91,8 @@ dependencies {
 }
 
 apply(from = "tauri.build.gradle.kts")
+
+// Tauri regenerates the debug block above. Keep the side-by-side install ID here.
+android.buildTypes.named("debug") {
+    applicationIdSuffix = ".practice"
+}
